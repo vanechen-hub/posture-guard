@@ -1,0 +1,629 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>低头探颈检测器</title>
+<style>
+  :root { --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:#0b0f14; color:#e5e7eb;
+    font: 14px/1.5 -apple-system, "PingFang SC", "Helvetica Neue", sans-serif; }
+  #app { display:grid; grid-template-columns: 420px 1fr; gap:18px; padding:18px; height:100%; }
+  @media (max-width: 860px) { #app { grid-template-columns: 1fr; } }
+  .panel { background:#111827; border:1px solid #1f2937; border-radius:14px; padding:16px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  .sub { color:#9ca3af; font-size:12px; margin-bottom:14px; }
+  #camWrap { position:relative; border-radius:12px; overflow:hidden; background:#000; }
+  video, canvas.ov { width:100%; display:block; transform: scaleX(-1); }
+  canvas.ov { position:absolute; inset:0; }
+  .row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:7px 0;
+         border-bottom:1px dashed #1f2937; }
+  .row:last-child { border-bottom:0; }
+  .k { color:#9ca3af; }
+  .v { font-variant-numeric: tabular-nums; font-weight:600; }
+  .bar { height:7px; background:#1f2937; border-radius:99px; overflow:hidden; margin-top:5px; }
+  .bar > i { display:block; height:100%; width:0%; background:var(--ok); transition:width .12s linear; }
+  button { background:#1f2937; color:#e5e7eb; border:1px solid #374151; border-radius:9px;
+           padding:9px 14px; font-size:13px; cursor:pointer; }
+  button:hover { background:#374151; }
+  button.primary { background:#2563eb; border-color:#3b82f6; }
+  .btns { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 6px; }
+  label.slider { display:block; margin:12px 0 2px; color:#9ca3af; font-size:12px; }
+  input[type=range] { width:100%; }
+  .pill { display:inline-block; padding:3px 9px; border-radius:99px; font-size:12px; font-weight:700; }
+  .pill.ok { background:rgba(34,197,94,.15); color:var(--ok); }
+  .pill.bad { background:rgba(239,68,68,.18); color:var(--bad); }
+  .pill.wait { background:rgba(245,158,11,.16); color:var(--warn); }
+  /* 背景色是兜底；实际闪烁由 JS 每帧写内联 background（小窗里没有 CSS 动画也能红） */
+  #alert { position:fixed; inset:0; background:rgba(239,68,68,.72); z-index:99;
+           display:none; align-items:center; justify-content:center; flex-direction:column; }
+  #alert.on { display:flex; }
+  #alert b { font-size:min(13vw,120px); letter-spacing:.12em; color:#fff;
+             text-shadow:0 6px 40px rgba(0,0,0,.45); }
+  #alert span { font-size:min(4vw,26px); color:#fff; opacity:.92; margin-top:8px; }
+  @keyframes pulse { 0%,100%{ background:rgba(239,68,68,.62) } 50%{ background:rgba(220,38,38,.86) } }
+  code { background:#0b0f14; padding:1px 5px; border-radius:4px; color:#93c5fd; }
+
+  /* 视频上的红色警告（小窗有自己的一份，见 togglePip 注入的 CSS） */
+  #localAlert { position:absolute; inset:0; z-index:5; display:none;
+                background:rgba(220,38,38,.75);
+                align-items:center; justify-content:center; flex-direction:column; }
+  #localAlert.on { display:flex; }
+  #localAlert b { font-size:clamp(28px,14vw,80px); letter-spacing:.1em; color:#fff;
+                  text-shadow:0 4px 24px rgba(0,0,0,.5); }
+  #localAlert span { color:#fff; font-size:clamp(11px,4vw,20px); opacity:.92; }
+</style>
+</head>
+<body>
+
+<div id="alert"><b>坐 直</b><span id="alertWhy">低头 / 探颈</span></div>
+
+<div id="app">
+  <div class="panel">
+    <h1>低头探颈检测器</h1>
+    <div class="sub">先用标准坐姿点「校准基准」，之后偏离基准就整屏变红。</div>
+
+    <div class="row"><span class="k">状态</span><span id="state" class="pill wait">加载模型…</span></div>
+    <div class="row"><span class="k">低头角度</span><span class="v" id="vPitch">–</span></div>
+    <div class="row"><span class="k">探颈程度 (靠近)</span><span class="v" id="vFwd">–</span></div>
+    <div class="row"><span class="k">侧头 (不触发报警)</span><span class="v" id="vYaw">–</span></div>
+    <div class="row"><span class="k">帧率</span><span class="v" id="vFps">–</span></div>
+
+    <div style="margin-top:12px">
+      <div class="k" style="font-size:12px">低头偏离 / 阈值</div>
+      <div class="bar"><i id="barPitch"></i></div>
+      <div class="k" style="font-size:12px;margin-top:10px">探颈偏离 / 阈值</div>
+      <div class="bar"><i id="barFwd"></i></div>
+    </div>
+
+    <div class="btns">
+      <button class="primary" id="btnCal">校准基准 (C)</button>
+      <button id="btnPip">📌 置顶小窗 (P)</button>
+      <button id="btnSound">🔔 提示音：关</button>
+      <button id="btnNotify">🔕 系统通知：关</button>
+      <button id="btnMesh">显示网格：开</button>
+      <button id="btnTest">🧪 测试红屏 (T)</button>
+    </div>
+    <div class="sub" style="margin:2px 0 0">
+      切到别的标签页时浏览器会冻结页面动画 — 点<b>置顶小窗</b>，检测和红屏就会跟着小窗浮在所有窗口上面。
+    </div>
+
+    <label class="slider">低头灵敏度 — 超过 <span id="tPitchV">12</span>° 算低头（越小越敏感）</label>
+    <input type="range" id="tPitch" min="4" max="35" value="12">
+
+    <label class="slider">探颈灵敏度 — 距离缩短 <span id="tFwdV">8</span>% 算探颈</label>
+    <input type="range" id="tFwd" min="3" max="30" value="8">
+
+    <label class="slider">持续时间 <span id="tHoldV">0.8</span> 秒后才报警</label>
+    <input type="range" id="tHold" min="0" max="30" value="8">
+
+    <div class="sub" style="margin-top:14px">
+      判定：<code>低头</code> = 由关键点深度算出的真实俯仰角相对基准的变化；
+      <code>探颈</code> = 3D 位姿给出的到相机距离相对基准缩短。
+      尺度基准不再用两眼间距（一侧头就按 cos 缩短，导致侧脸漏报），
+      所以<b>侧头、歪头都不会误报也不会漏报</b>。几何部分的数值验证见
+      <code>node posture-guard/test-math.mjs</code>。
+    </div>
+  </div>
+
+  <div class="panel" style="display:flex;flex-direction:column;gap:10px">
+    <div id="pipHost">
+      <div id="camWrap">
+        <video id="cam" playsinline muted></video>
+        <canvas class="ov" id="ov"></canvas>
+        <div id="localAlert"><b>坐 直</b><span id="localWhy">低头 / 探颈</span></div>
+      </div>
+    </div>
+    <div class="sub" id="hint">正在请求摄像头权限…（画面只在本机处理，不上传）</div>
+  </div>
+</div>
+
+<script type="module">
+import { FaceLandmarker, FilesetResolver }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+// ===== 以下为 posture-math.mjs 内联版（改动请改源文件后重跑 build.sh）=====
+// 姿态几何：把人脸关键点换成「与偏头(yaw)、歪头(roll)、远近都无关」的低头 / 探颈信号。
+//
+// 为什么不能用眼距做尺度：绕垂直轴偏头时投影眼距按 cos(yaw) 缩短，
+// 于是「探颈」被算成负值、「低头」比值被算成变大 —— 侧脸时两个信号同时漏报。
+
+const IDX = { L_EYE: 33, R_EYE: 263, CHIN: 152, BROW: 10, NOSE: 1 };
+
+const len = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+
+/**
+ * @param lm     MediaPipe faceLandmarks[0]（归一化 0..1 坐标）
+ * @param aspect 画面宽/高，用来把 x 还原成等比坐标
+ * @param matrix facialTransformationMatrixes[0].data（列主序 4x4，可缺省）
+ */
+function faceMetrics(lm, aspect, matrix) {
+  // z 与 x 同尺度（MediaPipe 约定），所以和 x 一样乘 aspect，才能跟 y 放在同一坐标系里比
+  const P = i => ({ x: lm[i].x * aspect, y: lm[i].y, z: (lm[i].z || 0) * aspect });
+  const le = P(IDX.L_EYE), re = P(IDX.R_EYE), chin = P(IDX.CHIN), nose = P(IDX.NOSE);
+  const eyeMid = { x: (le.x + re.x) / 2, y: (le.y + re.y) / 2, z: (le.z + re.z) / 2 };
+  const iod = len(le, re);
+
+  // 偏头指数：鼻尖到左右眼角的距离差，归一化到 -1..1（0 = 正脸）。
+  // 纯比例，不依赖相机参数，也不涉及欧拉角的符号约定。
+  // 只用来判断「是不是正对镜头」（校准时要求正脸）。30° 以上会饱和甚至回落，
+  // 所以绝不拿它做定量的侧脸补偿 —— 补偿改用下面的 vert 比值。
+  const dl = len(nose, le), dr = len(nose, re);
+  const yawIdx = (dl - dr) / (dl + dr);
+
+  // 到相机的距离：用 MediaPipe 4x4 变换矩阵的平移量（列主序第 15 个元素 = tz）。
+  // 它对偏头和低头都不敏感，是理想的尺度基准 —— 原来用眼距，一偏头就崩。
+  const tz = matrix && matrix.length === 16 ? Math.abs(matrix[14]) : 0;
+  const usedMatrix = tz > 1e-6;
+
+  // vert = |眼线中点 → 下巴| 的 2D 长度：绕垂直轴旋转几乎不改变它，歪头也不影响（取欧氏长度）。
+  // 它和 iod 的比值就是侧脸程度：偏头时 iod 按 cos(yaw) 缩短而 vert 不变。
+  const vert = len(eyeMid, chin);
+  const dist = usedMatrix ? tz : 1 / Math.max(1e-6, vert);   // 退路：vert 也是与偏头无关的尺度
+
+  // 低头的原始量：眼线中点 → 下巴 的深度差与竖直差。
+  // MediaPipe 的 z 越小越靠近相机，低头时下巴相对眼睛后移 → dz 变大。
+  const dy = chin.y - eyeMid.y;
+  const dz = chin.z - eyeMid.z;
+  const has3d = Number.isFinite(chin.z) && chin.z !== 0;
+
+  const roll = Math.atan2(re.y - le.y, re.x - le.x) * 180 / Math.PI;
+  return { iod, vert, dist, dy, dz, yawIdx, roll, usedMatrix, has3d };
+}
+
+/** 相对校准基准的偏离：down 单位是度（正 = 低头），craning 是百分比（正 = 头往屏幕凑） */
+function deviations(m, base) {
+  // 侧脸程度 = 当前 (iod/vert) 相对基准的比值 ≈ cos(yaw)。
+  // 距离变化会同时缩放两者而互相约掉；低头对 vert 的影响很小，上限截到 1。
+  const cosYaw = Math.min(1, Math.max(0.3, (m.iod / m.vert) / (base.iod / base.vert)));
+  const deg = (dz, dy) => Math.atan2(dz, Math.max(1e-6, dy)) * 180 / Math.PI;
+  return {
+    down: base.has3d && m.has3d
+      ? deg(m.dz / cosYaw, m.dy) - deg(base.dz, base.dy)   // 侧脸时 dz 被 cos(yaw) 压缩，除回来
+      : (base.vert * base.dist - m.vert * m.dist) / (base.vert * base.dist) * 100,
+    craning: (base.dist - m.dist) / base.dist * 100,
+    cosYaw,
+    unit: base.has3d && m.has3d ? '°' : '%',
+  };
+}
+
+/** 旧版指标，仅供对比/回归测试：眼距当尺度，侧脸会失效 */
+function legacyMetrics(lm, aspect) {
+  const P = i => ({ x: lm[i].x * aspect, y: lm[i].y });
+  const le = P(IDX.L_EYE), re = P(IDX.R_EYE), chin = P(IDX.CHIN);
+  const iod = len(le, re);
+  const eyeMidY = (le.y + re.y) / 2;
+  return { iod, ratio: (chin.y - eyeMidY) / iod };
+}
+function legacyDeviations(m, base) {
+  return {
+    down: (base.ratio - m.ratio) / base.ratio * 100,
+    craning: (m.iod - base.iod) / base.iod * 100,
+  };
+}
+
+// ===== 内联结束 =====
+const $ = id => document.getElementById(id);
+const video = $('cam'), ov = $('ov'), ctx = ov.getContext('2d');
+// 这些节点会被搬进画中画窗口 → 必须启动时缓存引用，
+// 搬走之后主文档的 getElementById 会返回 null（之前报警时就是在这里抛异常把循环打死的）
+const alertEl = $('alert'), alertWhy = $('alertWhy');
+const camWrap = $('camWrap'), pipHost = $('pipHost');
+const localAlert = $('localAlert'), localWhy = $('localWhy');
+
+let landmarker = null, running = false, lastVideoTime = -1;
+let base = null;                 // {ratio, iod}
+let soundOn = false, showMesh = true, notifyOn = false;
+let badSince = 0, isBad = false, audioCtx = null, lastBeep = 0;
+let fpsT = performance.now(), fpsN = 0;
+let pipWin = null, keepAlive = null, lastWhy = '';
+let pipCanvas = null, pipCtx = null, pipAlert = null, pipWhy = null, pipHud = null;
+let lastTick = 0;
+
+const cfg = { pitch: 12, fwd: 8, hold: 0.8 };
+const bindRange = (id, valId, key, fmt = v => v) => {
+  const el = $(id);
+  el.oninput = () => { cfg[key] = key === 'hold' ? el.value / 10 : +el.value; $(valId).textContent = fmt(cfg[key]); };
+};
+bindRange('tPitch', 'tPitchV', 'pitch');
+bindRange('tFwd', 'tFwdV', 'fwd');
+bindRange('tHold', 'tHoldV', 'hold', v => v.toFixed(1));
+
+$('btnSound').onclick = e => { soundOn = !soundOn; e.target.textContent = `🔔 提示音：${soundOn ? '开' : '关'}`; };
+$('btnMesh').onclick  = e => { showMesh = !showMesh; e.target.textContent = `显示网格：${showMesh ? '开' : '关'}`; };
+$('btnCal').onclick   = () => calibrate();
+$('btnPip').onclick   = () => togglePip().catch(err => {
+  $('hint').textContent = '打开置顶小窗失败：' + err.message;
+  console.error(err);
+});
+$('btnNotify').onclick = async e => {
+  if (!notifyOn) {
+    const p = await Notification.requestPermission();
+    if (p !== 'granted') { $('hint').textContent = '系统通知被拒绝，请到 Chrome 站点设置里放开。'; return; }
+  }
+  notifyOn = !notifyOn;
+  e.target.textContent = `${notifyOn ? '🔔' : '🔕'} 系统通知：${notifyOn ? '开' : '关'}`;
+};
+$('btnTest').onclick = () => toggleTest();
+addEventListener('keydown', onKey);
+function onKey(e) {
+  const k = e.key.toLowerCase();
+  if (k === 'c') calibrate();
+  if (k === 'p') $('btnPip').onclick();
+  if (k === 't') toggleTest();
+}
+
+// 不用真的低头就能确认红屏/小窗红色是通的
+let testTimer = null;
+function toggleTest() {
+  if (testTimer) {
+    clearInterval(testTimer); testTimer = null; paint(false);
+    $('btnTest').textContent = '🧪 测试红屏 (T)';
+    return;
+  }
+  paint(true, '测试中');
+  testTimer = setInterval(flash, 60);
+  $('btnTest').textContent = '🧪 停止测试';
+}
+
+// —— 置顶小窗：切标签/切应用后唯一还能被看见、且 rAF 不被冻结的地方 —— //
+async function togglePip() {
+  if (pipWin) { pipWin.close(); return; }
+  if (!('documentPictureInPicture' in window)) {
+    $('hint').textContent = '这个 Chrome 版本不支持画中画文档窗（需要 Chrome 116+）。已改用后台定时检测 + 提示音/系统通知。';
+    return;
+  }
+  pipWin = await documentPictureInPicture.requestWindow({ width: 340, height: 255 });
+  const d = pipWin.document;
+  // PiP 是独立文档，不继承主页面 CSS —— 显式注入
+  const st = d.createElement('style');
+  st.textContent = `
+    * { box-sizing:border-box; margin:0; }
+    html,body { height:100%; background:#000; overflow:hidden;
+      font:13px/1.35 -apple-system,"PingFang SC",sans-serif; color:#fff; }
+    #stage { position:relative; width:100%; height:100%; }
+    #pipCanvas { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+    #pipAlert { position:absolute; inset:0; z-index:5; display:none;
+      background:rgba(220,38,38,.78);
+      align-items:center; justify-content:center; flex-direction:column; }
+    #pipAlert.on { display:flex; }
+    #pipAlert b { font-size:clamp(28px,15vw,90px); letter-spacing:.1em;
+      text-shadow:0 4px 24px rgba(0,0,0,.5); }
+    #pipAlert span { font-size:clamp(11px,5vw,22px); opacity:.95; }
+    #pipHud { position:absolute; left:0; right:0; bottom:0; z-index:9; padding:3px 7px;
+      background:rgba(0,0,0,.55); font-variant-numeric:tabular-nums; font-size:11px; }`;
+  d.head.appendChild(st);
+  // 关键：不再把 <video> 搬进来。媒体元素换 document 会重跑 load 算法并暂停，
+  // readyState 掉回 0，MediaPipe 就再也拿不到帧 —— 这正是小窗里检测失效的原因。
+  // 现在 video 和检测始终留在主页面，小窗只是一块被镜像过来的 canvas。
+  d.body.innerHTML =
+    '<div id="stage"><canvas id="pipCanvas"></canvas>' +
+    '<div id="pipAlert"><b>坐 直</b><span id="pipWhy">低头 / 探颈</span></div>' +
+    '<div id="pipHud">检测中…</div></div>';
+  pipCanvas = d.getElementById('pipCanvas');
+  pipCanvas.width = ov.width || 640; pipCanvas.height = ov.height || 480;
+  pipCtx = pipCanvas.getContext('2d');
+  pipAlert = d.getElementById('pipAlert');
+  pipWhy = d.getElementById('pipWhy');
+  pipHud = d.getElementById('pipHud');
+  pipWin.addEventListener('keydown', onKey);
+  $('btnPip').textContent = '📌 关闭小窗 (P)';
+  pipRafDead = false;
+  pipWin.addEventListener('pagehide', () => {
+    pipWin = pipCanvas = pipCtx = pipAlert = pipWhy = pipHud = null;
+    pipRafDead = false;
+    $('btnPip').textContent = '📌 置顶小窗 (P)';
+    paint(isBad || !!testTimer, lastWhy);   // 换宿主时保持当前警告状态（含测试模式）
+    ticking = false; schedule();     // 宿主换回主页面，重新起一个 tick
+  });
+  paint(isBad || !!testTimer, lastWhy);   // 换宿主时保持当前警告状态（含测试模式）
+  ticking = false; schedule();       // 立刻切到小窗的 rAF 上驱动
+}
+
+// 把主页面的画面 + 网格镜像进小窗
+function mirror() {
+  if (!pipCtx) return;
+  pipCtx.save();
+  pipCtx.setTransform(-1, 0, 0, 1, pipCanvas.width, 0);   // 左右镜像，和主页面观感一致
+  if (video.readyState >= 2) pipCtx.drawImage(video, 0, 0, pipCanvas.width, pipCanvas.height);
+  pipCtx.drawImage(ov, 0, 0, pipCanvas.width, pipCanvas.height);
+  pipCtx.restore();
+}
+
+// 静音音频让 Chrome 不对隐藏标签做「重度定时器节流」（无小窗时的兜底）
+function startKeepAlive() {
+  if (keepAlive) return;
+  audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  g.gain.value = 0.0001;            // 实际听不见，但算「正在播放音频」
+  o.connect(g).connect(audioCtx.destination); o.start();
+  keepAlive = { o, g };
+}
+
+let pendingCal = 0, calAcc = [], calStart = 0;
+function calibrate() {
+  if (!running) {                    // 否则状态会永远停在「校准中」
+    setState('bad', '摄像头未就绪');
+    return;
+  }
+  pendingCal = 30;                   // 采 30 帧取中位数
+  calAcc = [];
+  calStart = performance.now();
+  setState('wait', '校准中…请保持标准坐姿');
+}
+function setState(cls, text) { const s = $('state'); s.className = 'pill ' + cls; s.textContent = text; }
+
+function median(a) { const s = [...a].sort((x, y) => x - y); return s[s.length >> 1]; }
+
+async function init() {
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { width: { ideal: 960 }, height: { ideal: 720 }, facingMode: 'user' }, audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    $('hint').textContent = '摄像头就绪 — 画面仅在本机处理，不会上传。';
+  } catch (err) {
+    setState('bad', '摄像头不可用');
+    $('hint').textContent = '无法访问摄像头：' + err.message + '（请在 http://localhost 下打开并允许权限）';
+    return;
+  }
+
+  // 模型来源：优先用同目录下的本地副本。Google 的 storage.googleapis.com 在部分网络
+  // 完全不可达（实测 20s 超时），只挂官方地址会让页面永远停在「加载模型…」。
+  const MODEL_SOURCES = [
+    './face_landmarker.task',
+    'https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task',
+  ];
+
+  // 任何一步失败或卡死都必须让用户看见，不能静默停在「加载模型…」
+  const withTimeout = (promise, ms, what) => Promise.race([
+    promise,
+    new Promise((_, rej) => setTimeout(() => rej(new Error(`${what} 超时（${ms / 1000}s）`)), ms)),
+  ]);
+
+  let fileset;
+  try {
+    setState('wait', '加载运行时…');
+    fileset = await withTimeout(FilesetResolver.forVisionTasks(
+      "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"), 30000, '运行时下载');
+  } catch (err) {
+    setState('bad', '运行时加载失败');
+    $('hint').textContent = 'MediaPipe 运行时下载失败：' + err.message + '（需要能访问 cdn.jsdelivr.net）';
+    return;
+  }
+
+  let lastErr;
+  for (const src of MODEL_SOURCES) {
+    const local = !src.startsWith('http');
+    try {
+      setState('wait', local ? '加载本地模型…' : '加载在线模型…');
+      landmarker = await withTimeout(FaceLandmarker.createFromOptions(fileset, {
+        baseOptions: { modelAssetPath: src, delegate: "GPU" },
+        runningMode: "VIDEO", numFaces: 1, outputFaceBlendshapes: false,
+        outputFacialTransformationMatrixes: true   // 平移量用作与偏头无关的距离基准
+      }), local ? 20000 : 45000, '模型加载');
+      break;
+    } catch (err) {
+      lastErr = err;
+      console.warn('模型来源失败:', src, err);
+    }
+  }
+  if (!landmarker) {
+    setState('bad', '模型加载失败');
+    $('hint').textContent = '所有模型来源都失败了：' + (lastErr && lastErr.message) +
+      '。请确认同目录下有 face_landmarker.task（3.6MB）。';
+    return;
+  }
+
+  ov.width = video.videoWidth; ov.height = video.videoHeight;
+  setState('wait', '请按「校准基准」');
+  running = true;
+  startKeepAlive();
+  schedule();
+}
+
+// 帧调度：优先用可见窗口的 rAF；主页面被隐藏又没开小窗时退回定时器
+let ticking = false, pipRafDead = false;
+function schedule() {
+  if (!running || ticking) return;   // 同一时刻只留一个待执行的 tick
+  ticking = true;
+  // 小窗可见 → 用它的 rAF（不被节流）；若它的 rAF 被判定不触发，降级成定时器
+  if (pipWin && !pipWin.closed && !pipRafDead) return void pipWin.requestAnimationFrame(loop);
+  if (pipWin && !pipWin.closed) return void setTimeout(loop, 66);
+  if (document.visibilityState === 'visible') return void requestAnimationFrame(loop);
+  setTimeout(loop, 200);   // 隐藏标签：降到 ~5fps 继续检测
+}
+document.addEventListener('visibilitychange', () => { ticking = false; schedule(); });
+
+// 看门狗：任何原因（rAF 被冻结、宿主窗口切换、异常）导致超过 1.2 秒没跑一帧，就强制重启循环。
+// 这样检测循环不会再有「悄悄死掉」的可能。
+setInterval(() => {
+  if (!running) return;
+  if (performance.now() - lastTick > 1200) {
+    // 小窗开着却卡住 → 说明它的 rAF 不给回调，永久降级到定时器
+    if (pipWin && !pipWin.closed) pipRafDead = true;
+    ticking = false;
+    schedule();
+  }
+}, 500);
+
+function beep() {
+  if (!soundOn) return;
+  const now = performance.now();
+  if (now - lastBeep < 1800) return;
+  lastBeep = now;
+  audioCtx ||= new (window.AudioContext || window.webkitAudioContext)();
+  const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+  o.frequency.value = 660; o.type = 'sine';
+  g.gain.setValueAtTime(.0001, audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(.25, audioCtx.currentTime + .02);
+  g.gain.exponentialRampToValueAtTime(.0001, audioCtx.currentTime + .35);
+  o.connect(g).connect(audioCtx.destination); o.start(); o.stop(audioCtx.currentTime + .36);
+}
+
+// 画红：全部用内联样式，不依赖任何 CSS 是否成功注入；
+// 宿主文档取自 camWrap.ownerDocument，所以在主页面和小窗里都成立
+function paint(bad, why = '') {
+  if (why) lastWhy = why;
+  for (const el of [alertEl, localAlert, pipAlert]) {
+    if (!el) continue;
+    el.classList.toggle('on', bad);
+    el.style.display = bad ? 'flex' : 'none';
+    if (!bad) el.style.background = '';
+  }
+  if (lastWhy) for (const el of [alertWhy, localWhy, pipWhy]) if (el) el.textContent = lastWhy;
+  document.body.style.background = bad ? '#7f1d1d' : '';
+  if (pipWin) pipWin.document.body.style.background = bad ? '#7f1d1d' : '#000';
+}
+// 闪烁：不用 CSS 动画，避免小窗里 keyframes 没注入就完全不红
+function flash() {
+  const a = .55 + .3 * Math.abs(Math.sin(performance.now() / 380));
+  const c = `rgba(220,38,38,${a.toFixed(3)})`;
+  for (const el of [alertEl, localAlert, pipAlert]) if (el) el.style.background = c;
+}
+
+// 主页面看不见、也没开小窗时的最后兜底
+function notify(why) {
+  if (!notifyOn || Notification.permission !== 'granted') return;
+  if (document.visibilityState === 'visible' || pipWin) return;
+  new Notification('坐直！', { body: why, tag: 'posture', renotify: true });
+}
+
+function loop() {
+  ticking = false;
+  lastTick = performance.now();
+  if (!running) return;
+  try {
+    if (video.currentTime !== lastVideoTime && video.readyState >= 2) {
+      lastVideoTime = video.currentTime;
+      const res = landmarker.detectForVideo(video, performance.now());
+      handle(res);
+      if (++fpsN >= 15) {
+        const t = performance.now();
+        const fps = (fpsN * 1000 / (t - fpsT)).toFixed(0);
+        $('vFps').textContent = fps + ' fps';
+        if (pipHud) pipHud.textContent =
+          `${fps} fps · ${$('vPitch').textContent} 低头 · ${$('vFwd').textContent} 探颈`;
+        fpsT = t; fpsN = 0;
+      }
+    }
+    mirror();
+    if (isBad) flash();
+  } catch (err) {
+    // 别再让一次异常静默地把检测循环打死 —— 报出来，然后继续跑
+    console.error(err);
+    $('hint').textContent = '检测出错（已自动继续）：' + err.message;
+  } finally {
+    schedule();
+  }
+}
+
+function handle(res) {
+  ctx.clearRect(0, 0, ov.width, ov.height);
+  const faces = res.faceLandmarks;
+  if (!faces || !faces.length) {
+    if (pendingCal > 0 && performance.now() - calStart > 5000) {   // 别卡在「校准中」
+      pendingCal = 0;
+      $('hint').textContent = '校准超时：5 秒内没稳定检测到人脸，请正对镜头再按 C。';
+    }
+    setState('wait', '没检测到人脸');
+    $('vPitch').textContent = $('vFwd').textContent = $('vYaw').textContent = '–';
+    trigger(false, '');
+    return;
+  }
+  const lm = faces[0];
+  const m = faceMetrics(lm, ov.width / ov.height, res.facialTransformationMatrixes?.[0]?.data);
+
+  if (showMesh) drawMesh(lm);
+
+  if (pendingCal > 0) {
+    calAcc.push(m); pendingCal--;
+    if (pendingCal === 0) {
+      // 基准必须是正脸：侧着头校准的话，后面所有的侧脸补偿都会以歪的为准
+      const yaw = median(calAcc.map(x => Math.abs(x.yawIdx)));
+      if (yaw > 0.13) {
+        setState('wait', '请正对摄像头再校准');
+        $('hint').textContent = `校准失败：检测到明显侧脸（偏头指数 ${yaw.toFixed(2)}）。正对镜头后再按 C。`;
+      } else {
+        base = {
+          iod:  median(calAcc.map(x => x.iod)),
+          vert: median(calAcc.map(x => x.vert)),
+          dist: median(calAcc.map(x => x.dist)),
+          dy:   median(calAcc.map(x => x.dy)),
+          dz:   median(calAcc.map(x => x.dz)),
+          has3d: calAcc[0].has3d, usedMatrix: calAcc[0].usedMatrix,
+        };
+        setState('ok', '已校准 · 监测中');
+        $('hint').textContent = '已校准。侧头/歪头不会误报，低头和探颈才会。';
+      }
+    }
+    trigger(false, '');
+    return;
+  }
+  if (!base) { trigger(false, ''); return; }
+  if (base.usedMatrix !== m.usedMatrix || base.has3d !== m.has3d) {
+    setState('wait', '数据源变了，请重新校准');   // 尺度基准换了，旧基准不可比
+    trigger(false, ''); return;
+  }
+
+  const d = deviations(m, base);          // d.down 单位为度（正 = 低头），d.craning 为 %
+  const yawDeg = Math.acos(d.cosYaw) * 180 / Math.PI;
+
+  $('vPitch').textContent = (d.down    >= 0 ? '+' : '') + d.down.toFixed(1) + d.unit;
+  $('vFwd').textContent   = (d.craning >= 0 ? '+' : '') + d.craning.toFixed(1) + '%';
+  $('vYaw').textContent   = '≈' + yawDeg.toFixed(0) + '°' + (yawDeg > 50 ? '（大幅侧头）' : '');
+  setBar('barPitch', d.down    / cfg.pitch);
+  setBar('barFwd',   d.craning / cfg.fwd);
+
+  // 迟滞：越过 100% 触发，回落到 70% 才解除
+  const th = isBad ? 0.7 : 1.0;
+  const downBad = d.down    > cfg.pitch * th;
+  const fwdBad  = d.craning > cfg.fwd   * th;
+  const why = downBad && fwdBad ? '低头 + 探颈' : downBad ? '低头' : fwdBad ? '探颈' : '';
+  trigger(downBad || fwdBad, why);
+}
+
+function setBar(id, frac) {
+  const el = $(id), p = Math.max(0, Math.min(1.6, frac));
+  el.style.width = Math.min(100, p / 1.6 * 100) + '%';
+  el.style.background = p >= 1 ? 'var(--bad)' : p >= .7 ? 'var(--warn)' : 'var(--ok)';
+}
+
+function trigger(bad, why) {
+  const now = performance.now();
+  if (bad) {
+    if (!badSince) badSince = now;
+    if (!isBad && now - badSince >= cfg.hold * 1000) {
+      isBad = true;
+      setState('bad', '姿势不良：' + why);
+      notify(why);
+    }
+    if (isBad) { paint(true, why); beep(); }
+  } else {
+    badSince = 0;
+    if (isBad) {
+      isBad = false;
+      paint(false);
+      setState('ok', base ? '姿势良好' : '请按「校准基准」');
+    } else if (base) setState('ok', '姿势良好');
+  }
+}
+
+function drawMesh(lm) {
+  ctx.fillStyle = isBad ? 'rgba(255,90,90,.85)' : 'rgba(120,220,160,.7)';
+  for (let i = 0; i < lm.length; i += 3) {
+    ctx.fillRect(lm[i].x * ov.width - 1, lm[i].y * ov.height - 1, 2, 2);
+  }
+  ctx.strokeStyle = isBad ? '#ef4444' : '#22c55e';
+  ctx.lineWidth = 2;
+  const seg = (a, b) => { ctx.beginPath();
+    ctx.moveTo(lm[a].x * ov.width, lm[a].y * ov.height);
+    ctx.lineTo(lm[b].x * ov.width, lm[b].y * ov.height); ctx.stroke(); };
+  seg(IDX.L_EYE, IDX.R_EYE); seg(IDX.NOSE, IDX.CHIN); seg(IDX.BROW, IDX.CHIN);
+}
+
+init();
+</script>
+</body>
+</html>
